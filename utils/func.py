@@ -11,16 +11,29 @@ from typing import Iterable
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch_geometric.datasets import TUDataset
 from torch_geometric.loader import DataLoader
-from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
+from wandb.wandb_run import Run
 
 from .dataset import CVSplitDataset
-from .utils import ModelLogging
 from .model import model_factory
-from .dist import setup, cleanup
+from .utils import ModelLogging
+
+
+def setup(rank, world_size):
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+
+    # initialize the process group
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+
+
+def cleanup():
+    dist.destroy_process_group()
 
 
 def add_weight_decay(model, weight_decay):
@@ -105,6 +118,7 @@ def train(model, train_loader: Iterable, loss_func, optimizer, device, tqdm_enab
             output = model(data)
             # todo:定义自己的loss项
             loss = loss_func(output, data.y)
+            loss_all += loss.item()
         scaler.scale(loss).backward()
         scaler.step(optimizer)
         scaler.update()
@@ -207,10 +221,12 @@ def wait_cuda(require_mem=23, overall_mem=24):
             time.sleep(random.randint(10, 60))
 
 
-def train_model(model_name, epochs, dataset_name, seed, exp_dir=pathlib.Path('.'), init_lr=1e-3, batch_size=32,
-                weight_decay=1e-4, early_stop_patience=100, device=None, rank=None, world_size=None):
+def train_model(model_config, epochs, dataset_name, seed, exp_dir=pathlib.Path('.'), init_lr=1e-3, batch_size=32,
+                weight_decay=1e-4, early_stop_patience=100, device=None, rank=None, world_size=None,
+                wandb_run: Run = None, amp_enable=True):
     set_seed(seed)
     early_stop_patience = early_stop_patience
+    exp_dir = pathlib.Path(exp_dir)
     exp_name = exp_dir.stem
     print(f'Start {exp_name}')
     if rank is None and world_size is None:
@@ -221,9 +237,12 @@ def train_model(model_name, epochs, dataset_name, seed, exp_dir=pathlib.Path('.'
 
     # 数据集变换和划分
     dataset_path = f'data/'
+
     # todo:自己的数据
     dataset = TUDataset(dataset_path, name=dataset_name, use_edge_attr=True, use_node_attr=True)
     dataset = dataset.shuffle()
+    model_config['in_channels'] = dataset.num_features
+    model_config['out_channels'] = dataset.num_classes
 
     for train_data, val_data, test_data in CVSplitDataset(dataset, cv=1, val=True):
         # 数据集加载
@@ -231,28 +250,49 @@ def train_model(model_name, epochs, dataset_name, seed, exp_dir=pathlib.Path('.'
         val_loader = DataLoader(val_data, batch_size=batch_size)
         test_loader = DataLoader(test_data, batch_size=batch_size)
 
-        # loss
-        loss = F.mse_loss
-        optimizer = torch.optim.SGD(model_name.parameters, lr=init_lr, momentum=.9, weight_decay=weight_decay)
+        # todo:loss
+        loss = F.cross_entropy
+        model = model_factory(model_config).to(device)
+        optimizer = torch.optim.SGD(model.parameters(), lr=init_lr, momentum=.9, weight_decay=weight_decay)
         lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 100, .1)
-        logging = ModelLogging(model_name, optimizer, lr_scheduler, exp_dir / 'checkpoints.pt',
-                               early_stop_patience)
+
+        logging = ModelLogging(model, optimizer, lr_scheduler, exp_dir / 'checkpoints.pt', early_stop_patience,
+                               wandb=wandb_run)
+        if wandb_run:
+            config = {
+                'lr': init_lr,
+                'epochs': epochs,
+                'batch_size': batch_size,
+                'weight_decay': weight_decay,
+                'early_stop_patience': early_stop_patience,
+                'optim': optimizer.__class__.__name__,
+                'lr_scheduler': lr_scheduler.__class__.__name__,
+                'model': model.__class__.__name__,
+            }
+            config.update(model_config)
+            wandb_run.config.update(config)
+
         # todo:模型生成方法
-        model = model_factory(model_name).to(device)
         if rank is not None:
             model = DDP(model, device_ids=[rank])
         for epoch in tqdm(range(epochs)):
-            train_metric = train(model, train_loader, loss, optimizer, device)
-            val_metric = test(model, val_loader, loss, device)
+            train_metric = train(model, train_loader, loss, optimizer, device, amp_enable=amp_enable)
+            val_metric = test(model, val_loader, loss, device, amp_enable=amp_enable)
 
-            if logging(train_metric, val_metric):
+            # 学习率
+            lr = [param_group['lr'] for param_group in optimizer.param_groups][0]
+            if logging(train_metric, val_metric, lr) or epoch + 1 == epochs:
                 # load最好的模型
                 logging.load_model()
                 # 记录最好的模型
-                logging.check_points(test_loss=test(model, test_loader, loss, device))
+                test_metric = test(model, test_loader, loss, device, amp_enable=amp_enable)
+                logging.check_points(test_loss=test_metric)
 
-            print(f'Epoch{epoch}: Train{train_metric}, Val{val_metric}')
+            print(f'Epoch{epoch}: Train{train_metric}, Val{val_metric}, LR{lr}')
 
         if rank and world_size:
             # 并行训练清理
             cleanup()
+
+    if wandb_run:
+        wandb_run.finish()

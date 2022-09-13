@@ -6,6 +6,7 @@ class CVSplitDataset:
     """
     交叉验证分割数据集
     """
+
     def __init__(self, dataset, cv=10, train_raio=.8, exp_num=1, val=False):
         """
         :param dataset:
@@ -23,12 +24,12 @@ class CVSplitDataset:
     def __iter__(self):
         if self.cv == 1:
             for i in range(self.n):
-                train_index, test_index = train_test_split(self.dataset, train_size=self.train_ratio)
+                train_set, test_set = train_test_split(self.dataset, train_size=self.train_ratio)
                 if not self.val:
-                    yield self.dataset[train_index], self.dataset[test_index]
+                    yield train_set, test_set
                 else:
-                    val = int(len(test_index) // 2)
-                    yield self.dataset[train_index], self.dataset[test_index[:val]], self.dataset[test_index[val:]]
+                    val = int(len(test_set) // 2)
+                    yield train_set, test_set[:val], test_set[val:]
         else:
             if self.n == 1:
                 cv = KFold(n_splits=self.cv, shuffle=True)

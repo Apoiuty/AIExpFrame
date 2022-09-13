@@ -20,23 +20,15 @@ from .func import train_model
 #    world_size=world_size)
 # For TcpStore, same way as on Linux.
 
-def setup(rank, world_size):
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
 
-    # initialize the process group
-    dist.init_process_group("gloo", rank=rank, world_size=world_size)
-
-
-def cleanup():
-    dist.destroy_process_group()
 
 
 def parallel_train_func(func, model_name, epochs, dataset_name, seed, exp_dir=pathlib.Path('.'), init_lr=1e-3,
-                        batch_size=32,
-                        weight_decay=1e-4, early_stop_patience=100):
+                        batch_size=32, weight_decay=1e-4, early_stop_patience=100, wandb_run=None, amp_enable=True):
     """
     并行训练的函数，返回接口为rank，world_size的函数
+    :param amp_enable:
+    :param wandb_run:
     :param func:
     :param model_name:
     :param epochs:
@@ -53,7 +45,7 @@ def parallel_train_func(func, model_name, epochs, dataset_name, seed, exp_dir=pa
     @wraps(func)
     def wrapper(rank, world_size):
         train_model(model_name, epochs, dataset_name, seed, exp_dir, init_lr, batch_size, weight_decay,
-                    early_stop_patience, rank, world_size)
+                    early_stop_patience, rank=rank, world_size=world_size, wandb_run=wandb_run, amp_enable=amp_enable)
 
     return wrapper
 
