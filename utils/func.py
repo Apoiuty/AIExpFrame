@@ -1,29 +1,31 @@
-import math
-from .dataset import CVSplitDataset
-from .utils import EarlyStopping
-import os
 import gc
+import math
+import os
 import pathlib
 import random
 import re
 import time
 from collections import defaultdict
 from datetime import datetime
+from typing import Iterable
 
 import numpy as np
-import tensorflow as tf
 import torch
 import torch.nn.functional as F
 from torch_geometric.datasets import TUDataset
 from torch_geometric.loader import DataLoader
+from torch.nn.parallel import DistributedDataParallel as DDP
 from tqdm import tqdm
 
-from model import *
+from .dataset import CVSplitDataset
+from .utils import ModelLogging
+from .model import model_factory
+from .dist import setup, cleanup
 
 
 def add_weight_decay(model, weight_decay):
     """
-    对参数施加L2正则化，其中不对偏置进行正则化
+    对参数施加L2正则化，不对偏置进行正则化
     :param model: 模型
     :param weight_decay 权重衰减
     :return:
@@ -81,9 +83,10 @@ def seed_worker(worker_seed):
     random.seed(worker_seed)
 
 
-def train(model, train_loader, loss_func, optimizer, device, tqdm_enable=False):
+def train(model, train_loader: Iterable, loss_func, optimizer, device, tqdm_enable=False, amp_enable=True):
     """
     模型训练
+    :param amp_enable:
     :param model:
     :param train_loader:
     :param device:
@@ -93,11 +96,12 @@ def train(model, train_loader, loss_func, optimizer, device, tqdm_enable=False):
     :return:
     """
     loss_all = 0
-    scaler = torch.cuda.amp.GradScaler(enabled=True)
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_enable)
     for data in tqdm(train_loader, disable=not tqdm_enable):
         data = data.to(device)
         optimizer.zero_grad()
-        with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=True):
+        # 混合精度训练
+        with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=amp_enable):
             output = model(data)
             # todo:定义自己的loss项
             loss = loss_func(output, data.y)
@@ -112,9 +116,10 @@ def train(model, train_loader, loss_func, optimizer, device, tqdm_enable=False):
     return loss_all / len(train_loader.dataset)
 
 
-def test(model, loader, loss_func, device, tqdm_enable=True):
+def test(model, loader: Iterable, loss_func, device, tqdm_enable=True, amp_enable=True):
     """
     模型测试
+    :param amp_enable:
     :param model:
     :param loader:
     :param device:
@@ -126,7 +131,7 @@ def test(model, loader, loss_func, device, tqdm_enable=True):
     with torch.inference_mode():
         for data in tqdm(loader, disable=not tqdm_enable):
             data = data.to(device)
-            with torch.autocast(device_type='cuda', dtype=torch.float16):
+            with torch.autocast(device_type='cuda', dtype=torch.float16, enabled=amp_enable):
                 output = model(data)
                 loss = loss_func(output, data.y)
                 loss_all += loss.item()
@@ -202,13 +207,17 @@ def wait_cuda(require_mem=23, overall_mem=24):
             time.sleep(random.randint(10, 60))
 
 
-def train_model(model, epochs, dataset_name, seed, exp_dir=pathlib.Path('.'), init_lr=1e-3, batch_size=32,
-                weight_decay=1e-4, early_stop_patience=100, device=None):
+def train_model(model_name, epochs, dataset_name, seed, exp_dir=pathlib.Path('.'), init_lr=1e-3, batch_size=32,
+                weight_decay=1e-4, early_stop_patience=100, device=None, rank=None, world_size=None):
     set_seed(seed)
     early_stop_patience = early_stop_patience
-    exp_name = f'{model.__name__}_{dataset_name}'
+    exp_name = exp_dir.stem
     print(f'Start {exp_name}')
-    device = find_idle_cuda() if device is None else device
+    if rank is None and world_size is None:
+        device = find_idle_cuda() if device is None else device
+    else:
+        device = rank
+        setup(rank, world_size)
 
     # 数据集变换和划分
     dataset_path = f'data/'
@@ -224,11 +233,26 @@ def train_model(model, epochs, dataset_name, seed, exp_dir=pathlib.Path('.'), in
 
         # loss
         loss = F.mse_loss
-        optimizer = torch.optim.SGD(model.parameters, lr=init_lr, momentum=.9, weight_decay=weight_decay)
-        early_stopping = EarlyStopping(early_stop_patience, mode='max')
+        optimizer = torch.optim.SGD(model_name.parameters, lr=init_lr, momentum=.9, weight_decay=weight_decay)
+        lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 100, .1)
+        logging = ModelLogging(model_name, optimizer, lr_scheduler, exp_dir / 'checkpoints.pt',
+                               early_stop_patience)
+        # todo:模型生成方法
+        model = model_factory(model_name).to(device)
+        if rank is not None:
+            model = DDP(model, device_ids=[rank])
         for epoch in tqdm(range(epochs)):
             train_metric = train(model, train_loader, loss, optimizer, device)
             val_metric = test(model, val_loader, loss, device)
 
-            if early_stopping(val_metric):
-                break
+            if logging(train_metric, val_metric):
+                # load最好的模型
+                logging.load_model()
+                # 记录最好的模型
+                logging.check_points(test_loss=test(model, test_loader, loss, device))
+
+            print(f'Epoch{epoch}: Train{train_metric}, Val{val_metric}')
+
+        if rank and world_size:
+            # 并行训练清理
+            cleanup()
